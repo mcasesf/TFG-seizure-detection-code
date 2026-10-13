@@ -292,24 +292,3 @@ Some names in the code differ from the terminology used in the paper and in this
 | Class balancing | training: 1:1 by subsampling normal chunks; validation: not rebalanced |
 
 </details>
-
----
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@misc{cases2026featureextractors,
-  author       = {Cases Font, Marc},
-  title        = {A Comparative Study of Feature Extractors for Epileptic Seizure Detection},
-  howpublished = {Bachelor's thesis, Universitat Aut{\`o}noma de Barcelona (UAB), Centre de Visi{\'o} per Computador (CVC)},
-  year         = {2026}
-}
-```
-
-The CHB-MIT database should be cited as:
-
-- A. H. Shoeb, *Application of machine learning to epileptic seizure onset detection and treatment*, Ph.D. dissertation, MIT, 2009.
-- J. Guttag, "CHB-MIT Scalp EEG Database (version 1.0.0)," PhysioNet, 2010. doi: [10.13026/C2K01R](https://doi.org/10.13026/C2K01R).
-- A. L. Goldberger et al., "PhysioBank, PhysioToolkit, and PhysioNet: Components of a new research resource for complex physiologic signals," *Circulation*, vol. 101, no. 23, 2000.
