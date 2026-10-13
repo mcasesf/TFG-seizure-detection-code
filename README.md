@@ -1,42 +1,169 @@
 # A Comparative Study of Feature Extractors for Epileptic Seizure Detection
 
-Code for the Bachelor's thesis (TFG) of **Marc Cases Font**, Bachelor's Degree in Data Engineering, Universitat Autònoma de Barcelona (UAB), carried out at the Centre de Visió per Computador (CVC).
+**Bachelor's thesis (TFG)** · Marc Cases Font · Bachelor's Degree in Data Engineering, Universitat Autònoma de Barcelona (UAB) · Centre de Visió per Computador (CVC)
 
-📄 **Paper:** [`docs/TFG_MarcCases.pdf`](docs/TFG_MarcCases.pdf)
-
-This study asks one design question: **how does the way raw EEG is turned into features affect a deep-learning seizure detector?** Instead of proposing a new end-to-end system, the downstream classifier (a shared LSTM) and the whole training pipeline are held fixed, and only the window-level feature extractor `g(·)` changes. Four extractors (S1–S4) are compared on the CHB-MIT scalp-EEG database under three cross-validation protocols of increasing strictness, from a permissive split that mixes data from the same patient to a fully patient-independent (leave-subjects-out) split.
+📄 Read the paper: [`docs/TFG_MarcCases.pdf`](docs/TFG_MarcCases.pdf)
 
 ---
 
-## Contents
+## About the project
 
-- [Key results](#key-results)
-- [Method overview](#method-overview)
-- [Terminology: paper vs. code](#terminology-paper-vs-code)
-- [Repository structure](#repository-structure)
-- [Setup](#setup)
-- [Running the experiments](#running-the-experiments)
-- [Outputs](#outputs)
-- [Implementation details](#implementation-details)
-- [Reproducibility notes](#reproducibility-notes)
-- [Citation](#citation)
+Epilepsy affects around 50 million people worldwide, and about one third of patients keep having seizures despite medication. Patients are often monitored with an **electroencephalogram (EEG)**, which records brain activity through electrodes placed on the scalp. These recordings can last for hours or days, while a seizure may last only a few seconds. Today, finding those seconds usually means a specialist reading the recording by eye, which is slow, expensive and error-prone. **Automatic seizure detection** aims to do this job with a computer.
+
+Any detection system has to turn the raw EEG signal into a compact set of features that a classifier can work with. This project focuses on that one step: **how the choice of feature extractor affects the performance of a deep-learning seizure detector.**
+
+Most published work presents a complete system end to end, which makes it hard to tell which design choice is responsible for the results. Instead, this project runs a **controlled comparison**:
+
+- The classifier, the data processing and the training procedure are the same for every experiment.
+- Only the feature extractor changes, so any difference in performance can be traced back to it.
+
+A second goal is to check **how trustworthy the evaluation is**. Results in this field are easily inflated when data from the same patient ends up in both the training and the test set. For that reason, every extractor is evaluated under three validation protocols of increasing strictness. The strictest one tests the model only on patients it has never seen during training.
+
+All experiments use the public [CHB-MIT Scalp EEG Database](https://physionet.org/content/chbmit/1.0.0/).
 
 ---
 
-## Key results
+## How it works
 
-**The validation protocol dominates the reported performance.** The raw baseline S1 is the *best* model when highly overlapping chunks can fall in both training and validation (by chunk), and the *worst* on unseen patients (by patient). Under the patient-independent protocol, the per-channel CNN and the inter-channel Transformer each improve on S1, and their combination (S4) gives the best recall and F1.
+### From EEG to a prediction
 
-F1 (%), mean ± std across the 5 folds, last epoch:
+```mermaid
+flowchart LR
+    X["EEG window<br/>22 channels × 2 s"] --> G["feature extractor<br/>g(·)"]
+    G --> V["feature vector"]
+    V --> C["30 consecutive vectors<br/>(60 s of context)"]
+    C --> L["LSTM"]
+    L --> P["probability that the<br/>last window is a seizure"]
+```
 
-| Strategy | by chunk | by recording | by patient |
+1. **Pre-processing.** Each recording keeps 22 standard EEG channels, sampled at 256 Hz. Each channel is normalised (z-score) over the whole recording.
+2. **Windows.** The signal is cut into consecutive, non-overlapping **windows** of 2 seconds, each 22 channels × 512 samples.
+3. **Feature extraction.** A feature extractor `g(·)` turns each window into a feature vector. **This is the only part that changes between experiments.**
+4. **Classification.** A **chunk** of 30 consecutive windows (60 s of context) is fed, as a sequence of feature vectors, to a shared two-layer LSTM. The LSTM outputs the probability that the **last window** of the chunk is ictal, that is, part of a seizure.
+
+**Labels.** The task is binary: *ictal* (seizure, 1) vs. *interictal* (normal background activity, 0). The 5 minutes before and the 5 minutes after each seizure are transition periods. They are never used as targets, but they can appear as context inside a chunk.
+
+### The four feature extractors
+
+The extractors are organised along two independent design choices:
+- whether each channel is first compressed by a small neural network;
+- whether the channels are mixed with an attention mechanism.
+
+| | Channels concatenated (flatten) | Channels mixed by a Transformer |
+|---|---|---|
+| **Raw signal** | **S1 — raw + flatten** | **S3 — raw + Transformer** |
+| **Per-channel CNN** | **S2 — CNN + flatten** | **S4 — CNN + Transformer** |
+
+- **S1 — raw + flatten.** This is the baseline, with no feature extraction at all. The raw window is flattened into one long vector, and the LSTM has to learn everything by itself.
+- **S2 — CNN + flatten.** A small 1D convolutional network, shared by all channels, summarises each channel into 64 values. The 22 summaries are then concatenated.
+- **S3 — raw + Transformer.** Each channel is treated as a *token*, and a Transformer encoder mixes the information across channels through self-attention. The output of a special summary token (CLS) represents the window.
+- **S4 — CNN + Transformer.** This combines both ideas: the CNN of S2 summarises each channel, and the Transformer of S3 mixes the resulting summaries.
+
+Comparing pairs isolates each design choice. S1 → S2 and S3 → S4 measure the effect of the per-channel CNN. S1 → S3 and S2 → S4 measure the effect of the Transformer.
+
+The paper also describes two further variants based on a self-supervised autoencoder (S5, S6). They are planned for future work and are not part of this repository.
+
+---
+
+## Validation protocols: how the data is partitioned
+
+### Cross-validation in a nutshell
+
+Every experiment uses **5-fold cross-validation**:
+1. The data is divided into 5 groups, called *folds*.
+2. The model is trained 5 times from scratch, always starting from the same initial weights. Each time, one fold is held out for validation and the other four are used for training.
+3. In the end, every sample has been used for validation exactly once. The results are reported as the **mean ± standard deviation over the 5 folds**.
+
+The important question is **which unit is assigned to a fold**. EEG data is strongly structured:
+- each patient has several recordings;
+- each recording contains many chunks;
+- consecutive chunks overlap in time.
+
+If closely related data ends up on both sides of the split, the model is tested on something almost identical to what it learned from, and the score no longer reflects how it would perform in practice. The three protocols differ **only** in this unit. They go from the most permissive to the strictest, so comparing them shows how much the reported performance depends on the evaluation.
+
+Only *valid* chunks are partitioned. A chunk is valid when its last window is ictal or interictal.
+
+### An illustration
+
+Imagine two patients with two recordings each. Every digit below is one chunk, and its value is the fold in which that chunk is used for **validation**. In the other four folds, the same chunk is used for training.
+
+```
+                    Patient chb01                    Patient chb02
+                recording 1    recording 2      recording 1    recording 2
+
+By chunk        3 1 5 2 4 1    2 5 3 4 1 2      4 2 1 5 3      1 3 5 2 4    ← every chunk is assigned on its own
+By recording    2 2 2 2 2 2    5 5 5 5 5 5      1 1 1 1 1      3 3 3 3 3    ← a whole recording goes to one fold
+By patient      4 4 4 4 4 4    4 4 4 4 4 4      1 1 1 1 1      1 1 1 1 1    ← a whole patient goes to one fold
+```
+
+### Protocol 1 — By chunk
+
+- **How it is built.** The valid chunks of every patient and recording are pooled together. The pool is shuffled with a fixed random seed and dealt into 5 folds of about 20 % each, so each fold is an 80/20 split. The patient and the recording a chunk comes from are ignored.
+- **What can leak.** Every patient, and almost every recording, appears in both training and validation. Worse, seizure chunks are extracted at every window (stride 1), so two consecutive seizure chunks share 29 of their 30 windows. One of them can be in the training set while its near-copy is in the validation set.
+- **What it measures.** How well the model recognises data that is almost the same as data it has already seen. This protocol is an **optimistic upper bound**, not a realistic estimate.
+
+### Protocol 2 — By recording
+
+- **How it is built.** The unit is the recording, that is, one EDF file. The recordings that contain at least one valid chunk are shuffled with a fixed seed and dealt into 5 folds. All the chunks of a recording always go to the same fold. The patient is ignored.
+- **What can leak.** No recording is split between training and validation, so the overlap between neighbouring chunks no longer leaks. However, a patient usually has several recordings, and they are spread over different folds. The model is therefore validated on new recordings of patients it has already been trained on. A patient is not guaranteed to appear in the validation set of every fold, and the folds are balanced in number of recordings, not in number of seizures.
+- **What it measures.** How well the model generalises to **new recordings of known patients**. Its strictness is intermediate.
+
+### Protocol 3 — By patient (leave-subjects-out)
+
+- **How it is built.** The unit is the patient, that is, one case folder `chb01` … `chb24`. The 24 patients are shuffled with a fixed seed and dealt into 5 groups of 5, 5, 5, 5 and 4 patients. In each fold:
+  - all the recordings of one group are the validation set;
+  - all the recordings of the remaining 19–20 patients are the training set.
+- **What can leak.** Nothing between patients: no patient is ever in both sets. Each patient is validated exactly once, by a model that never saw them during training.
+- **What it measures.** How well the model works on **new patients**, which is the realistic clinical scenario. The main conclusions of the project are drawn from this protocol.
+
+### Side by side
+
+| | By chunk | By recording | By patient |
+|---|---|---|---|
+| Unit assigned to a fold | chunk | recording (EDF file) | patient |
+| Nearly identical chunks in training and validation | possible | no | no |
+| Same recording in training and validation | yes | no | no |
+| Same patient in training and validation | yes | yes | no |
+| Measures generalisation to… | data already seen | new recordings | new patients |
+| Strictness | lowest | intermediate | highest |
+
+### What happens inside each fold
+
+- **Training set: balanced.** Normal (interictal) chunks far outnumber seizure (ictal) chunks. Normal chunks are therefore randomly discarded, with a fixed seed, until there is one per seizure chunk.
+- **Validation set: not rebalanced.** All seizure chunks and all normal chunks are kept, so normal activity remains the majority class. Normal chunks never overlap with each other, while seizure chunks are sampled at every window.
+- **Training and evaluation.** The model is trained for 30 epochs and evaluated with the weights of the last epoch.
+- **Per-patient metrics.** They are built from each patient's validation chunks:
+  - **by patient:** a patient appears in a single fold, so their metrics come from that fold;
+  - **by chunk and by recording:** a patient's validation chunks are spread over the 5 folds, so their confusion matrices are summed across folds. Each chunk is still counted exactly once.
+
+---
+
+## Results
+
+The models are compared with four metrics:
+- **recall (sensitivity):** the fraction of seizure windows that are detected. It is the most important metric clinically, because a missed seizure is the costliest error.
+- **precision**
+- **specificity**
+- **F1:** the single summary score used to compare models.
+
+### Main findings
+
+1. **The validation protocol matters more than the model.** The raw baseline S1 looks like the best model when the evaluation is permissive (F1 = 95.9 by chunk). It becomes the worst once it is tested on unseen patients (F1 = 16.8 by patient).
+2. **Both design choices help on unseen patients.** Adding a per-channel CNN improves results, and so does adding the Transformer. S4, which combines both, is the best model: recall 78.9 and F1 60.5 by patient.
+3. **Performance varies a lot from patient to patient.** Some patients are detected almost perfectly. In others, the model either misses most seizures or produces too many false alarms.
+
+### F1 score under each protocol
+
+Mean ± standard deviation across the 5 folds, in %:
+
+| Strategy | By chunk | By recording | By patient |
 |---|---|---|---|
 | S1 — raw + flatten | **95.89 ± 1.27** | 23.00 ± 5.65 | 16.83 ± 10.18 |
 | S2 — CNN + flatten | 92.34 ± 2.79 | **79.08 ± 6.55** | 46.62 ± 8.80 |
 | S3 — raw + Transformer | 80.91 ± 7.81 | 59.27 ± 6.25 | 47.05 ± 5.70 |
 | S4 — CNN + Transformer | 85.62 ± 4.61 | 76.88 ± 9.52 | **60.53 ± 18.92** |
 
-Patient-independent protocol (k-fold by patient, Table VII of the paper):
+### Unseen patients (by-patient protocol)
 
 | Strategy | Recall | Precision | Specificity | F1 |
 |---|---|---|---|---|
@@ -45,97 +172,7 @@ Patient-independent protocol (k-fold by patient, Table VII of the paper):
 | S3 — raw + Transformer | 57.40 ± 17.77 | 46.80 ± 17.31 | 92.40 ± 4.84 | 47.05 ± 5.70 |
 | S4 — CNN + Transformer | **78.90 ± 13.54** | **57.11 ± 28.88** | 88.79 ± 15.18 | **60.53 ± 18.92** |
 
-<details>
-<summary>Full fold-level tables for the other two protocols (Tables V and VI)</summary>
-
-**k-fold by chunk** (Table V, most optimistic):
-
-| Strategy | Recall | Precision | Specificity | F1 |
-|---|---|---|---|---|
-| S1 — raw + flatten | **98.07 ± 1.36** | **93.86 ± 2.75** | **99.34 ± 0.31** | **95.89 ± 1.27** |
-| S2 — CNN + flatten | 97.20 ± 1.23 | 88.15 ± 5.91 | 98.64 ± 0.75 | 92.34 ± 2.79 |
-| S3 — raw + Transformer | 96.40 ± 2.44 | 70.67 ± 12.60 | 95.57 ± 2.66 | 80.91 ± 7.81 |
-| S4 — CNN + Transformer | 89.40 ± 2.67 | 82.86 ± 9.68 | 97.98 ± 1.52 | 85.62 ± 4.61 |
-
-**k-fold by recording** (Table VI, intermediate strictness):
-
-| Strategy | Recall | Precision | Specificity | F1 |
-|---|---|---|---|---|
-| S1 — raw + flatten | 14.10 ± 3.36 | 64.14 ± 20.37 | **99.20 ± 0.43** | 23.00 ± 5.65 |
-| S2 — CNN + flatten | 80.88 ± 7.65 | **78.93 ± 12.48** | 97.66 ± 1.85 | **79.08 ± 6.55** |
-| S3 — raw + Transformer | 57.35 ± 8.05 | 65.73 ± 17.92 | 96.15 ± 3.25 | 59.27 ± 6.25 |
-| S4 — CNN + Transformer | **89.18 ± 6.26** | 69.76 ± 16.01 | 95.29 ± 3.86 | 76.88 ± 9.52 |
-
-</details>
-
-The per-patient metrics of every strategy and protocol are in Appendix B of the paper (Tables IX–XI).
-
----
-
-## Method overview
-
-### Shared pipeline
-
-Every strategy shares the same pipeline (Fig. 1 of the paper). Only the feature extractor `g(·)` changes.
-
-```mermaid
-flowchart LR
-    X["window X_i<br/>22 ch × 512 samples (2 s)"] --> G["g(·)<br/>feature extractor<br/>S1–S4"]
-    G --> V["v_i<br/>(d_window)"]
-    V --> C["chunk: 30 consecutive v_i<br/>(60 s of context)"]
-    C --> L["2-layer LSTM<br/>hidden 256"]
-    L --> H["head<br/>LayerNorm → Dropout → Linear"]
-    H --> P["p_i = P(last window is ictal)"]
-```
-
-- **Data:** CHB-MIT, 24 cases, 22 bipolar channels (Table I), 256 Hz. Each recording is z-scored per channel over the whole recording, then cut into non-overlapping 2 s **windows**.
-- **Labels:** ictal (1) vs. interictal (0). A 5 min preictal buffer (SPH = 0, SOP = 5 min) and a 5 min postictal buffer are excluded as targets. They can still appear as context inside a chunk.
-- **Samples:** a **chunk** is a sequence of N = 30 consecutive windows, labelled with its last window. Ictal chunks use stride 1, so the scarce positive class is sampled densely. Interictal chunks use stride 30, so they do not overlap.
-- **Classifier:** a 2-layer LSTM (hidden 256) whose last hidden state goes through LayerNorm → Dropout → Linear(256 → 1).
-
-### Feature extractors
-
-The four evaluated strategies sit on two orthogonal axes (Table III):
-
-| | **Flatten** | **Transformer + CLS** |
-|---|---|---|
-| **No compressor (raw)** | **S1** · d_window = 11 264 | **S3** · d_window = 128 |
-| **Supervised CNN** | **S2** · d_window = 1 408 | **S4** · d_window = 128 |
-| *Self-supervised AE* | *S5 · 2 816 (deferred)* | *S6 · 128 (deferred)* |
-
-- **S1 — raw + flatten** (Sec. VI-D). This is the baseline: no extractor. The 22 × 512 window is flattened in canonical channel order.
-- **S2 — CNN + flatten** (Sec. VI-E). A small 1D CNN with weights shared across channels (Table IV) turns each channel into a 64-d descriptor. The 22 descriptors are concatenated.
-- **S3 — raw + Transformer** (Sec. VI-F). Each raw channel (512 samples) is a token. A learnable CLS token is prepended, every token is projected to 128 dimensions, and a 4-layer pre-norm Transformer encoder mixes them. There is no channel embedding.
-- **S4 — CNN + Transformer** (Sec. VI-G). The S2 CNN produces 22 descriptors, which become tokens for the S3 Transformer.
-
-S5 and S6 (self-supervised autoencoder encoders) are described in the paper but are **not implemented** in this repository; they are deferred to a later iteration.
-
-### Validation protocols
-
-All three protocols use K = 5 folds and differ only in the grouping unit (Sec. VII-A):
-
-| Protocol | Grouping unit | What it measures | Scripts | Paper tables |
-|---|---|---|---|---|
-| **k-fold by chunk** | chunk | held-out chunks from seen recordings. Nearly identical ictal chunks can fall in both sets, so this is an optimistic upper bound | `experiments/1_by_chunk/` | V, IX |
-| **k-fold by recording** | EDF file | new recordings of already-seen patients | `experiments/2_by_recording/` | VI, X |
-| **k-fold by patient** (leave-subjects-out) | patient | unseen patients, the clinically relevant regime | `experiments/3_by_patient/` | VII, XI |
-
-In every fold, the training set is balanced to 1:1 by subsampling interictal chunks. The validation set is **not** rebalanced, so interictal chunks remain the majority.
-
----
-
-## Terminology: paper vs. code
-
-The scripts are kept **exactly as they were run** for the paper, so their identifiers, log messages and output file names still use the original internal naming. That naming swaps the meaning of *chunk* and *window* relative to the paper. The comments and docstrings in the scripts use the paper's terminology. Keep this mapping in mind when reading the code:
-
-| Paper | Meaning | In the code |
-|---|---|---|
-| **window** | 2 s segment, 22 channels × 512 samples | "chunk": `CHUNK_SEC`, `tchunk`, `chunkify()`, `label_single_chunk()` |
-| **chunk** | N = 30 consecutive windows (60 s), labelled by its last window | "ventana" / window: `WINDOW = 30`, `RawWindowDataset` |
-| chunk stride (ictal / interictal) | 1 / 30 windows | `STRIDE_WIN` / `STRIDE_WIN_INTERICTAL` |
-| strategy **SN** | feature extractor *N* | `casuisticaN` in output names, W&B runs and configs |
-| d_window | size of v_i | `lstm_input` |
-| protocol by chunk / recording / patient | k-fold grouping unit | `SPLIT = "chunk"` / `"recording"` / `"patient"` |
+The paper contains the complete tables for all three protocols and the results for every individual patient.
 
 ---
 
@@ -146,71 +183,57 @@ The scripts are kept **exactly as they were run** for the paper, so their identi
 ├── README.md
 ├── requirements.txt
 ├── data/
-│   └── README.md                 # how to obtain CHB-MIT and the seizure manifest
+│   └── README.md                 # how to get the dataset and the seizure annotations
 ├── docs/
 │   └── TFG_MarcCases.pdf         # the paper
 └── experiments/
-    ├── 1_by_chunk/               # k-fold by chunk      → Tables V and IX
+    ├── 1_by_chunk/               # protocol 1: split by chunk
     │   ├── s1_raw_flatten.py
     │   ├── s2_cnn_flatten.py
     │   ├── s3_raw_transformer.py
     │   └── s4_cnn_transformer.py
-    ├── 2_by_recording/           # k-fold by recording  → Tables VI and X
-    │   └── (same four scripts)
-    └── 3_by_patient/             # k-fold by patient    → Tables VII and XI
-        └── (same four scripts)
+    ├── 2_by_recording/           # protocol 2: split by recording (same four scripts)
+    └── 3_by_patient/             # protocol 3: split by patient (same four scripts)
 ```
 
-Each of the 12 scripts is **self-contained** and trains one strategy under one protocol (5 folds × 30 epochs). The scripts share all of their code except two parts:
-- the feature extractor `g(·)`, which is the same in every protocol folder;
-- the k-fold split function, which is the same for every strategy.
-
-Every script begins with a docstring that summarises its strategy, protocol and the paper tables it produces.
+Each script is self-contained. It trains and evaluates one feature extractor under one validation protocol: 5 folds × 30 epochs.
 
 ---
 
-## Setup
+## Getting started
 
-### Environment
+### 1. Install the dependencies
 
-Python ≥ 3.9 and a CUDA GPU are recommended.
+Python 3.9 or later is required, and a CUDA-capable GPU is strongly recommended.
 
 ```bash
 # install the PyTorch build that matches your CUDA version first: https://pytorch.org
 pip install -r requirements.txt
 ```
 
-### Data
+### 2. Get the data
 
-The scripts need two inputs. Both are described in detail in [`data/README.md`](data/README.md):
+Download the CHB-MIT database and prepare the seizure annotation file. Step-by-step instructions are in [`data/README.md`](data/README.md).
 
-1. **CHB-MIT Scalp EEG Database v1.0.0**, downloaded from PhysioNet. This is the folder that contains `chb01/ … chb24/`.
-2. **A seizure manifest** (`seizures_manifest.csv`) with one row per seizure: `patient, edf, seizure_idx, start_sec, end_sec`.
+### 3. Set the paths
 
-### Paths
-
-The paths are set at the top of every script, in the `CONFIG` block, and still point to the machine where the experiments were run. Edit them before running:
+At the top of each script, in the `CONFIG` block, point the two paths to your copy of the data:
 
 ```python
-DATA_ROOT    = Path(r".../chb-mit-scalp-eeg-database-1.0.0")
-SEIZURES_CSV = Path(r".../seizures_manifest.csv")
+DATA_ROOT    = Path(r"path/to/chb-mit-scalp-eeg-database-1.0.0")
+SEIZURES_CSV = Path(r"path/to/seizures_manifest.csv")
 ```
 
-### Weights & Biases
-
-Every script logs to W&B in the project `TFG-seizure-embeddings`. Either run `wandb login` first, or run offline with `WANDB_MODE=offline`.
-
----
-
-## Running the experiments
-
-Run any script from the repository root. Outputs go to the current working directory.
+### 4. Run an experiment
 
 ```bash
-# one experiment: S4 (CNN + Transformer) under the patient-independent protocol
+# S4 (CNN + Transformer) evaluated on unseen patients
 python experiments/3_by_patient/s4_cnn_transformer.py
+```
 
-# the full study (12 runs)
+To run the whole study (12 experiments):
+
+```bash
 for protocol in 1_by_chunk 2_by_recording 3_by_patient; do
   for strategy in s1_raw_flatten s2_cnn_flatten s3_raw_transformer s4_cnn_transformer; do
     python experiments/$protocol/$strategy.py
@@ -218,89 +241,63 @@ for protocol in 1_by_chunk 2_by_recording 3_by_patient; do
 done
 ```
 
-How each protocol loads the data:
-- **by chunk** and **by recording** build the full pool of chunks once (every EDF loaded and windowed into RAM), then split it by index in each fold.
-- **by patient** builds the training and validation datasets inside each fold, from that fold's patients.
+Training progress is logged to [Weights & Biases](https://wandb.ai). Run `wandb login` first, or set `WANDB_MODE=offline` to log locally only.
 
 ---
 
 ## Outputs
 
-Every run writes four CSV files, the last-epoch checkpoint of every fold, and W&B runs. `<prefix>` depends on the strategy (see the table below), and `<split>` is `chunk`, `recording` or `patient`.
+Each experiment writes its results to the current working directory:
 
-| Output | Content |
+| File | Content |
 |---|---|
-| `eval_<prefix>_per_epoch_…_kfold_<split>.csv` | train and validation metrics of every epoch of every fold (`fold, epoch, split, loss, acc, f1, recall, precision, specificity, tp, tn, fp, fn`) |
-| `eval_<prefix>_per_epoch_agg_…_kfold_<split>.csv` | mean ± std across folds for every epoch (learning curves) |
-| `eval_<prefix>_kfold_summary_…_<split>.csv` | last-epoch metrics of every fold, plus `mean` and `std` rows. This is the strategy's row in **Tables V–VII** |
-| `eval_<prefix>_per_patient_…_kfold_<split>.csv` | last-epoch metrics per patient, plus `mean` and `std` rows across patients. These are the strategy's columns in **Tables IX–XI** |
-| `checkpoints_…_<split>/last_fold<k>.pt` | model and optimizer state at epoch 30, validation metrics and config |
-| W&B | one run per fold plus a `_summary` run (per-fold table, per-patient table, mean ± std curves, CSVs as an artifact), grouped by run name |
+| `eval_*_per_epoch_*.csv` | training and validation metrics for every epoch of every fold |
+| `eval_*_per_epoch_agg_*.csv` | mean ± std across folds for every epoch (learning curves) |
+| `eval_*_kfold_summary_*.csv` | final metrics of each fold, plus their mean and standard deviation |
+| `eval_*_per_patient_*.csv` | final metrics for every patient, plus their mean and standard deviation |
+| `checkpoints_*/last_fold<k>.pt` | trained model of each fold, saved after the last epoch |
 
-| Strategy | CSV prefix | Checkpoint folder |
-|---|---|---|
-| S1 | `eval_raw_plain_lstm_*_casuistica1_*` | `checkpoints_raw_plain_lstm_casuistica1_ictal_<split>/` |
-| S2 | `eval_raw_lstm_window_*_casuistica2_*` | `checkpoints_raw_plain_lstm-withCNN_casuistica2_ictal_<split>/` |
-| S3 | `eval_raw_channel_transformer_*_casuistica3_*` | `checkpoints_raw_channel_transformer_casuistica3_ictal_<split>/` |
-| S4 | `eval_cnn_channel_transformer_*_casuistica4_*` | `checkpoints_cnn_channel_transformer_casuistica4_ictal_<split>/` |
-
-The validation metrics are computed at the window level of the paper, that is, one prediction per chunk for its last window, with a decision threshold of 0.5.
+All reported metrics come from the **last training epoch**, not from the best one, so that the evaluation does not depend on picking an epoch after the fact. Per-patient metrics that are undefined are written as `NaN`, for example precision for a patient on whom the model never predicts a seizure.
 
 ---
 
-## Implementation details
+## Notes on the code
 
-### Shared by all strategies
+Some names in the code differ from the terminology used in the paper and in this README:
+
+| Paper | In the code |
+|---|---|
+| **window**: 2 s of EEG | `chunk` (`CHUNK_SEC`, `chunkify()`, `tchunk`) |
+| **chunk**: 30 consecutive windows | `WINDOW`, `RawWindowDataset` |
+| strategy **S1–S4** | `casuistica1` – `casuistica4` in output file names and run names |
+
+<details>
+<summary><b>Model and training details</b></summary>
 
 | Element | Value |
 |---|---|
-| Window | L = 2 s, 22 × 512 samples at 256 Hz, no overlap |
-| Chunk | N = 30 windows (60 s). Stride 1 window for ictal chunks, 30 windows for interictal chunks |
-| Labelling | SPH = 0 min, SOP = 5 min (preictal buffer), 5 min postictal buffer |
-| Normalisation | per-channel, per-recording z-score (ε = 1e-8), applied before windowing |
-| LSTM | 2 layers, hidden size 256, dropout 0.3 between layers |
-| Head | LayerNorm → Dropout(0.3) → Linear(256 → 1) |
-| Loss | `BCEWithLogitsLoss`, `pos_weight = n_interictal / n_ictal` of the training set (≈ 1 after balancing) |
-| Optimiser | Adam, learning rate 1e-3, weight decay 1e-3, constant learning rate (no scheduler) |
-| Batch size | 128 chunks |
+| Window | 2 s, 22 channels × 512 samples (256 Hz), no overlap |
+| Chunk | 30 windows (60 s). Stride of 1 window for seizure chunks, 30 windows for normal chunks |
+| Excluded transition periods | 5 min before and 5 min after each seizure |
+| Normalisation | z-score per channel, over the whole recording |
+| Per-channel CNN (S2, S4) | 3 × [Conv1d + BatchNorm + GELU] with 16 / 32 / 64 filters, kernels 7 / 5 / 3, max-pooling 4 / 2 / –, then global average pooling and Dropout(0.1) + Linear(64 → 64) |
+| Transformer (S3, S4) | learnable CLS token, tokens projected to 128 dimensions, 4 pre-norm layers, 4 heads, feed-forward size 512, GELU, dropout 0.1, no channel embedding |
+| LSTM classifier | 2 layers, hidden size 256, dropout 0.3 |
+| Classification head | LayerNorm → Dropout(0.3) → Linear(256 → 1) |
+| Loss | binary cross-entropy (`BCEWithLogitsLoss`) |
+| Optimiser | Adam, learning rate 1e-3, weight decay 1e-3, no learning-rate schedule |
+| Batch size / epochs | 128 chunks / 30 epochs |
 | Gradient clipping | max norm 1.0 |
-| Epochs / model selection | 30 epochs. The metrics and checkpoint come from the last epoch, not the best one |
-| Cross-validation | K = 5, seed 123 (fold assignment, training subsampling and model initialisation, which is identical in every fold) |
-| Class balancing | training set: interictal chunks subsampled to 1:1. Validation set: not rebalanced |
+| Cross-validation | 5 folds, random seed 123 |
+| Class balancing | training: 1:1 by subsampling normal chunks; validation: not rebalanced |
 
-### Strategy-specific
-
-**Per-channel CNN** (S2, S4; Table IV). It is applied to each channel of each window with shared weights:
-
-| Block | Channels | Kernel | Pool |
-|---|---|---|---|
-| Conv1d + BatchNorm + GELU | 1 → 16 | 7 | MaxPool(4) |
-| Conv1d + BatchNorm + GELU | 16 → 32 | 5 | MaxPool(2) |
-| Conv1d + BatchNorm + GELU | 32 → 64 | 3 | — |
-| Global average pooling | 64 | — | — |
-| Dropout(0.1) + Linear | 64 → 64 | — | — |
-
-**Inter-channel Transformer** (S3, S4):
-- **Tokens:** a learnable CLS token plus the 22 channel tokens. In S3 these are the raw 512-sample channels; in S4 they are the 64-d CNN descriptors. A linear layer projects every token to d_model = 128.
-- **Encoder:** 4 pre-norm layers, 4 heads, feed-forward dimension 512, GELU, dropout 0.1.
-- **No channel embedding:** the channels are treated as an unordered set.
-- **Output:** the window representation v_i is the CLS output followed by a final LayerNorm.
-
----
-
-## Reproducibility notes
-
-- **Seeds.** Python, NumPy and PyTorch are seeded with `SEED = 123`. cuDNN is not forced into deterministic mode, so GPU runs can differ slightly from run to run.
-- **Last-epoch reporting.** All reported metrics come from epoch 30, not from the best validation epoch. The paper (Sec. VII-C) explains why.
-- **Per-patient F1 convention.** In the per-patient CSV, F1 is `NaN` whenever a patient has TP = 0, and `NaN` values are left out of the mean ± std across patients. In the per-patient tables of the paper (IX–XI), patients with precision = recall = 0 are reported with F1 = 0 and **are included** in the mean ± std. To reproduce the means in the paper, set those F1 values to 0 before averaging.
-- **Excluded recordings.** EDF files that lack any of the 22 canonical channels are skipped while the dataset is built. Each skip is printed as `[skip] <file>`.
-- **Memory.** The by-chunk and by-recording scripts keep the whole windowed dataset in RAM as float32, which takes several tens of GB for the full CHB-MIT database.
+</details>
 
 ---
 
 ## Citation
 
-If you use this code, please cite the thesis:
+If you use this code, please cite:
 
 ```bibtex
 @misc{cases2026featureextractors,
@@ -311,10 +308,8 @@ If you use this code, please cite the thesis:
 }
 ```
 
-Please also cite the CHB-MIT database and PhysioNet:
+The CHB-MIT database should be cited as:
 
 - A. H. Shoeb, *Application of machine learning to epileptic seizure onset detection and treatment*, Ph.D. dissertation, MIT, 2009.
-- A. L. Goldberger et al., "PhysioBank, PhysioToolkit, and PhysioNet: Components of a new research resource for complex physiologic signals," *Circulation*, vol. 101, no. 23, 2000.
 - J. Guttag, "CHB-MIT Scalp EEG Database (version 1.0.0)," PhysioNet, 2010. doi: [10.13026/C2K01R](https://doi.org/10.13026/C2K01R).
-
-The validation methodology follows D. Gil and A. Hernández-Sabaté, "What is the across-subject performance of your Artificial Intelligence method for EEG analysis?," *Biomedical Signal Processing and Control*, vol. 120, p. 110020, 2026.
+- A. L. Goldberger et al., "PhysioBank, PhysioToolkit, and PhysioNet: Components of a new research resource for complex physiologic signals," *Circulation*, vol. 101, no. 23, 2000.
