@@ -1,62 +1,88 @@
 # -*- coding: utf-8 -*-
 """
-train_raw_lstm_window.py
+S4 — CNN + Transformer  ·  protocolo k-fold by chunk
 
-Casuística 2a — Raw + CNN por canal + LSTM con ventana temporal.
+Código del TFG "A Comparative Study of Feature Extractors for Epileptic
+Seizure Detection" (Marc Cases Font, UAB / CVC). Las referencias a secciones,
+ecuaciones y tablas son las del paper (docs/TFG_MarcCases.pdf).
 
-Pipeline:
+Este script entrena y valida la estrategia S4 (Sec. VI-G) con el protocolo
+k-fold by chunk (Sec. VII-A.a) y produce:
+  - la fila S4 de la Tabla V (media ± std entre folds), y
+  - las columnas S4 de la Tabla IXb (métricas por paciente).
 
-  WINDOW chunks consecutivos  (contexto de 60 s)
+Terminología (paper  <->  código)
+  window : segmento de L = 2 s sin solape        <->  "chunk": CHUNK_SEC, tchunk,
+           (22 canales × 512 muestras, 256 Hz)         chunkify()
+  chunk  : N = 30 windows consecutivas (60 s);   <->  "ventana": WINDOW,
+           su etiqueta es la de su última window       RawWindowDataset
+  stride del chunk (ictal = 1, interictal = N)   <->  STRIDE_WIN,
+                                                       STRIDE_WIN_INTERICTAL
+  estrategia SN                                  <->  "casuisticaN" en los nombres
+                                                       de salida y de W&B
+  Los identificadores, los mensajes de log y los nombres de salida se
+  mantienen tal y como se ejecutaron los experimentos; los comentarios usan
+  la terminología del paper.
+
+Pipeline compartido (Sec. VI-A, Fig. 1)
+
+  chunk: N = 30 windows X_i ∈ R^(22×512)
       │
-      ▼  para cada chunk (22, T):
-         CNN aplicada a cada canal por separado (pesos compartidos)
-         → 22 vectores de CNN_OUT dims
-         → flatten → vector de 22*CNN_OUT dims  (representación del chunk)
+      ▼  g(·) aplicada a cada window   <- lo único que cambia entre S1–S4
+         CNN 1D por canal (Tabla IV) -> 22 descriptores F_i ∈ R^64
+         -> tokens + CLS (dim 64) -> Linear(64 -> 128) -> Transformer
+            encoder (el mismo que S3) -> salida del CLS -> v_i ∈ R^128
       │
-      ▼  secuencia (B, WINDOW, 22*CNN_OUT)
-  LSTM(input=22*CNN_OUT, hidden=HIDDEN, layers=N_LAYERS)
+      ▼  secuencia [v_(i-29), ..., v_i]  (B, N, d_window)
+  LSTM(input = d_window, hidden = 256, 2 capas, dropout 0.3)
       │
-      ▼  último hidden state (B, HIDDEN)
-  head(LayerNorm + Dropout + Linear)
+      ▼  último hidden state h_T (B, 256)
+  head: LayerNorm -> Dropout(0.3) -> Linear(256 -> 1)                (Eq. 4)
       │
-      ▼  logit  ->  ictal (1) / interictal (0)  del ÚLTIMO chunk
+      ▼  logit -> p_i = P(la última window del chunk es ictal)        (Eq. 3)
 
-La CNN se aplica POR CANAL con pesos compartidos: la misma red procesa
-cada uno de los 22 canales de cada chunk. Aprende patrones temporales
-locales (formas de onda, oscilaciones) dentro de cada canal antes de
-comprimir. Los 22 vectores resultantes se concatenan (flatten) para
-formar la representación del chunk completo, preservando la identidad
-de cada canal. Ese vector es UN PASO de la secuencia que recibe la
-LSTM — la secuencia son los WINDOW chunks en el tiempo, no los canales.
+Estrategia S4 — CNN + Transformer (Sec. VI-G)
+  Combina S2 y S3: la CNN por canal de S2 comprime cada canal en un
+  descriptor de 64 dims y el Transformer de S3 (sin channel embedding) mezcla
+  los 22 descriptores. La representación de la window es la salida del CLS
+  (con la misma LayerNorm final que S3). CNN, Transformer, LSTM y head se
+  entrenan end-to-end, sin pre-entrenamiento.
 
-La etiqueta que se predice es la del ÚLTIMO chunk de la ventana.
-Los chunks anteriores son el contexto temporal de la LSTM.
+Datos y etiquetado (Sec. III–V)
+  - CHB-MIT, 22 canales bipolares (Tabla I); un EDF al que le falte alguno se
+    descarta. z-score por canal sobre TODA la grabación (Eq. 2).
+  - Estados: ictal, preictal (SPH = 0, SOP = 5 min), postictal (5 min) e
+    interictal. Tarea binaria ictal (1) vs interictal (0): un chunk entra en
+    el dataset solo si su última window es ictal o interictal; preictal y
+    postictal solo aparecen como contexto dentro de un chunk.
 
-Normalización: z-score por canal sobre TODA la grabación.
-Etiquetas: ictal (1) vs interictal (0).
-Los chunks preictal y postictal se DESCARTAN (no son ni clase positiva ni
-negativa), igual que antes se descartaban ictal/postictal en la tarea
-preictal-vs-interictal. Así el interictal sigue siendo "lejos de crisis".
-Validación: K-fold a nivel de PACIENTE (group k-fold), SEED=123.
+Protocolo de validación: k-fold by chunk (Sec. VII-A.a)
+  - Se construye UNA vez el pool con todos los chunks válidos de todos los
+    EDF; se baraja con SEED y se reparte en round-robin en K = 5 folds
+    (80/20), sin tener en cuenta paciente ni recording.
+  - Es el esquema más optimista: chunks ictales consecutivos comparten 29 de
+    sus 30 windows y pueden caer a la vez en train y validación (cota
+    superior de rendimiento).
+  - Por paciente: cada paciente aparece en validación en los 5 folds (~20 %
+    de sus chunks en cada uno); su matriz de confusión se acumula a través
+    de los folds.
 
-Métricas (todas calculadas sobre la ÚLTIMA época, época 30):
-  - Agregado entre folds: media ± std de la última época a través de los
-    folds (recall, precision, f1, specificity, acc).
-  - A NIVEL DE PACIENTE: en cada fold se acumula la matriz de confusión
-    por paciente de los pacientes en VALIDACIÓN, y se calculan recall /
-    precision / f1 / specificity por paciente. Como el k-fold es por
-    paciente (leave-subjects-out), cada paciente se valida exactamente una
-    vez, así que al final se obtiene un set de métricas por paciente
-    sacado del fold en el que le tocó testear. Se añade además la media ±
-    std a través de los pacientes (ignorando NaN).
+Balanceo de clases (Sec. VII-A)
+  - TRAIN: los chunks interictales se submuestrean a 1:1 (con SEED).
+  - VALIDACIÓN: sin rebalancear (todos los chunks ictales y todos los
+    interictales sin solape), de modo que el interictal sigue siendo mayoría.
 
-Balanceo de clases:
-  - TRAIN: submuestreo del interictal a 1:1 (INTERICTAL_RATIO=1).
-  - VALIDACIÓN: SIN balancear (VAL_INTERICTAL_RATIO=None). Se conserva
-    todo el interictal para que recall / precision / specificity reflejen
-    la distribución real de clases y los resultados sean más fiables.
-
-Checkpoint: se guarda el modelo de la ÚLTIMA época (no el de mejor F1).
+Entrenamiento y métricas (Tabla II, Sec. VII-C)
+  - Adam (LR = 1e-3, weight decay = 1e-3), BCEWithLogitsLoss con
+    pos_weight = n_interictal / n_ictal del train (≈ 1), batch 128, grad
+    clipping 1.0, sin scheduler, 30 épocas. Mismo init (SEED) en todos los
+    folds. Se guarda el checkpoint de la ÚLTIMA época.
+  - Métricas de la ÚLTIMA época (30), no las del mejor checkpoint: recall,
+    precision, specificity, F1 (y acc), agregadas como media ± std (ddof=1)
+    entre los K = 5 folds.
+  - Por paciente: las mismas métricas, resumidas como media ± std entre
+    pacientes ignorando los valores indefinidos (NaN). Ver la nota de
+    metrics_from_counts sobre F1.
 """
 
 from __future__ import annotations
@@ -86,14 +112,15 @@ import wandb
 DATA_ROOT    = Path(r"C:\Users\mcasesf\Desktop\TFG-SeizurePrediction\chb-mit-scalp-eeg-database-1.0.0")
 SEIZURES_CSV = Path(r"C:\Users\mcasesf\Desktop\TFG-SeizurePrediction\seizures_manifest.csv")
 
-# --- Split / esquema de partición k-fold ---
-# Esta casuística usa group k-fold a NIVEL DE PACIENTE (leave-subjects-out).
+# --- Protocolo de validación (Sec. VII-A del paper) ---
+# Este script usa el k-fold BY CHUNK (Sec. VII-A.a): la unidad de partición
+# es el chunk, sin tener en cuenta paciente ni recording.
 # SPLIT se añade al nombre del run de W&B y al de los ficheros/carpeta de
-# salida, para no colisionar con runs ni ficheros de configuraciones
-# anteriores (p.ej. val balanceada) ni de otros esquemas de partición.
+# salida, para no colisionar con los runs ni los ficheros de los otros
+# protocolos.
 SPLIT = "chunk"
 
-CKPT_DIR  = Path(f"checkpoints_raw_plain_lstm-withCNN_casuistica2_ictal_{SPLIT}")
+CKPT_DIR  = Path(f"checkpoints_cnn_channel_transformer_casuistica4_ictal_{SPLIT}")
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 def last_path_for_fold(fold_idx: int) -> Path:
@@ -101,63 +128,85 @@ def last_path_for_fold(fold_idx: int) -> Path:
     return CKPT_DIR / f"last_fold{fold_idx}.pt"
 
 # Métricas por época de TODOS los folds (incluye columna 'fold')
-OUT_METRICS_CSV = Path(f"eval_raw_lstm_window_per_epoch_casuistica2_ictal_kfold_{SPLIT}.csv")
+OUT_METRICS_CSV = Path(f"eval_cnn_channel_transformer_per_epoch_casuistica4_ictal_kfold_{SPLIT}.csv")
 # Agregado POR ÉPOCA a través de folds: media ± std en cada época (curva)
-OUT_PER_EPOCH_AGG_CSV = Path(f"eval_raw_lstm_window_per_epoch_agg_casuistica2_ictal_kfold_{SPLIT}.csv")
+OUT_PER_EPOCH_AGG_CSV = Path(f"eval_cnn_channel_transformer_per_epoch_agg_casuistica4_ictal_kfold_{SPLIT}.csv")
 # Resumen: última época de cada fold + media ± std a través de folds
-OUT_SUMMARY_CSV = Path(f"eval_raw_lstm_window_kfold_summary_casuistica2_ictal_{SPLIT}.csv")
+# (fila de esta estrategia en la Tabla V del paper)
+OUT_SUMMARY_CSV = Path(f"eval_cnn_channel_transformer_kfold_summary_casuistica4_ictal_{SPLIT}.csv")
 # Métricas a NIVEL DE PACIENTE (última época): una fila por paciente +
-# media ± std a través de pacientes. Cada paciente sale del fold en el que
-# estuvo en validación (k-fold por paciente -> cada paciente se valida 1 vez).
-OUT_PER_PATIENT_CSV = Path(f"eval_raw_lstm_window_per_patient_casuistica2_ictal_kfold_{SPLIT}.csv")
+# media ± std a través de pacientes (Tabla IX del paper). La matriz de
+# confusión de cada paciente acumula sus chunks de validación de los 5 folds
+# (cada chunk se valida exactamente una vez).
+OUT_PER_PATIENT_CSV = Path(f"eval_cnn_channel_transformer_per_patient_casuistica4_ictal_kfold_{SPLIT}.csv")
 
-# --- Chunking ---
-CHUNK_SEC  = 2.0
-STRIDE_SEC = 2.0
-C          = 22          # número de canales
+# --- Windows (Sec. IV-A del paper) ---
+# OJO terminología: en el código "chunk" (CHUNK_SEC, tchunk, chunkify) es la
+# WINDOW del paper: segmento de L = 2 s sin solape (22 × 512 muestras a 256 Hz).
+CHUNK_SEC  = 2.0         # L: duración de cada window (s)
+STRIDE_SEC = 2.0         # stride entre windows (= L -> sin solape)
+C          = 22          # número de canales (Tabla I)
 
-# --- Ventana temporal ---
-WINDOW     = 30          # chunks por secuencia (30 * 2s = 60 s de historia)
-STRIDE_WIN = 1           # desplazamiento de la ventana ICTAL en chunks
-                         # (stride 1 -> se capturan todas las ventanas cuyo
-                         # último chunk es ictal; la clase positiva es escasa
-                         # y conviene muestrearla densamente)
-STRIDE_WIN_INTERICTAL = WINDOW   # = 30 -> desplazamiento de la ventana
-                         # INTERICTAL. Al ser igual a WINDOW, las ventanas
-                         # interictales NO se solapan (cada una empieza donde
-                         # acaba la anterior: 30 chunks = 60 s más tarde). Esto
-                         # reduce ~30x el nº de ventanas interictales tanto en
-                         # train como en val/test.
+# --- Chunks (Sec. IV-A del paper) ---
+# OJO terminología: en el código "WINDOW"/"ventana" es el CHUNK del paper:
+# N = 30 windows consecutivas (60 s de contexto). La etiqueta de un chunk es
+# la de su última window.
+WINDOW     = 30          # N: windows por chunk (30 × 2 s = 60 s de contexto)
+STRIDE_WIN = 1           # stride (en windows) de los chunks ICTALES
+                         # (stride 1 -> se capturan todos los chunks cuya
+                         # última window es ictal; la clase positiva es escasa
+                         # y conviene muestrearla densamente). Chunks ictales
+                         # consecutivos comparten 29 de sus 30 windows.
+STRIDE_WIN_INTERICTAL = WINDOW   # = N = 30 -> stride (en windows) de los
+                         # chunks INTERICTALES. Al ser igual a N, los chunks
+                         # interictales NO se solapan (cada uno empieza donde
+                         # acaba el anterior: 30 windows = 60 s más tarde).
+                         # Reduce ~30x el nº de chunks interictales tanto en
+                         # train como en validación.
 
-# --- Etiquetado de crisis ---
+# --- Etiquetado de crisis (Sec. III del paper) ---
+# Buffer preictal = [onset - (SPH + SOP), onset - SPH] (Eq. 1) y buffer
+# postictal de POSTICTAL_MIN tras el final de la crisis; ambos se excluyen
+# como objetivo de clasificación.
 SPH_MIN       = 0
 SOP_MIN       = 5
 POSTICTAL_MIN = 5
 
-# --- Submuestreo del interictal ---
-INTERICTAL_RATIO     = 1     # 1 interictal por ictal en TRAIN (balanceado 1:1)
-VAL_INTERICTAL_RATIO = None  # VALIDACIÓN SIN balancear: se conserva todo el
-                             # interictal para que recall/precision/specificity
-                             # reflejen la distribución real (resultados fiables)
+# --- Balanceo de clases (Sec. VII-A del paper) ---
+INTERICTAL_RATIO     = 1     # TRAIN: chunks interictales submuestreados a 1:1
+VAL_INTERICTAL_RATIO = None  # VALIDACIÓN sin rebalancear: se conservan todos
+                             # los chunks ictales y todos los interictales (sin
+                             # solape), así que el interictal sigue siendo
+                             # mayoría en validación
 
-# --- CNN por canal ---
-# Aplicada a cada canal de cada chunk por separado (pesos compartidos).
-# Salida: 22 vectores de CNN_OUT dims -> flatten -> 22*CNN_OUT dims por chunk.
+# --- CNN por canal (idéntica a la de S2; Tabla IV del paper) ---
+# Aplicada a cada canal de cada window por separado (pesos compartidos).
+# Salida: 22 vectores de CNN_OUT dims que después serán tokens del Transformer.
 CNN_CHANNELS = (16, 32, 64)   # filtros de las 3 capas conv
 CNN_KERNELS  = (7,  5,  3)    # kernel size de cada capa
 CNN_POOLS    = (4,  2,  1)    # MaxPool tras cada capa (1 = sin pool)
 CNN_OUT      = 64             # dims por canal tras la CNN
 CNN_DROPOUT  = 0.1
-# dim del vector por chunk que entra a la LSTM = C * CNN_OUT = 22 * 64 = 1408
 
-# --- Arquitectura LSTM ---
+# --- Transformer inter-canal (Sec. VI-F del paper) ---
+# Tokens = los 22 descriptores F_i de la CNN (dim CNN_OUT) + CLS.
+# Proyección lineal CNN_OUT -> D_MODEL antes del encoder.
+# Sin channel embedding: los canales se tratan como conjunto desordenado.
+D_MODEL       = 128
+N_HEADS       = 4
+N_TF_LAYERS   = 4
+DIM_FFN       = 512
+TF_ACTIVATION = "gelu"
+TF_DROPOUT    = 0.1
+# d_window (vector por window que entra a la LSTM) = D_MODEL = 128
+
+# --- Clasificador compartido: LSTM + head (Sec. VI-B, Tabla II) ---
 HIDDEN   = 256
 N_LAYERS = 2
-DROPOUT  = 0.3
+DROPOUT  = 0.3       # entre capas de la LSTM y en el head
 
-# --- Entrenamiento ---
-BATCH_SIZE   = 128      # la LSTM ve vectores de C*CNN_OUT=1408 por paso
-                         # (en vez de C*T=11264 sin CNN), así cabe más batch
+# --- Entrenamiento (Tabla II del paper) ---
+BATCH_SIZE   = 128       # chunks por batch (igual en S1–S4)
 EPOCHS       = 30
 LR           = 1e-3
 WEIGHT_DECAY = 1e-3
@@ -168,23 +217,22 @@ WEIGHT_DECAY = 1e-3
 # --- Verbosidad ---
 PRINT_EVERY_N_BATCHES = 10   # progreso dentro de cada epoch (None = silencio)
 
-# --- Split / K-Fold ---
-# Validación cruzada a NIVEL DE PACIENTE (group k-fold): los pacientes se
-# barajan con SEED y se reparten en N_FOLDS grupos. Cada grupo es la
-# validación exactamente una vez; el resto de pacientes son train. Así
-# ningún paciente aparece a la vez en train y val de un mismo fold.
-N_FOLDS              = 5     # nº de folds (4-5 recomendado con ~24 pacientes)
-SEED                 = 123   # baraja de pacientes + init del modelo (igual en todos los folds)
-VAL_SEED             = 124   # seed distinto para submuestreo val (no colisiona con train)
-
-# (VAL_PATIENT_FRACTION ya no se usa: la fracción de val la fija 1/N_FOLDS)
+# --- K-fold (Sec. VII-A.a del paper: by chunk) ---
+# Todos los chunks válidos se barajan con SEED y se reparten en round-robin
+# en N_FOLDS grupos (~20 % cada uno, 80/20), sin tener en cuenta paciente ni
+# recording. Cada grupo es la validación exactamente una vez.
+N_FOLDS              = 5     # K = 5
+SEED                 = 123   # baraja del k-fold + submuestreo de train +
+                             # init del modelo (igual en todos los folds)
+VAL_SEED             = 124   # no se usa en este protocolo (la validación no se submuestrea)
 
 PRELOAD_EDF = True
 
 # --- W&B ---
 WANDB_PROJECT  = "TFG-seizure-embeddings"
-WANDB_RUN_NAME = f"raw_cnn_lstm_window_casuistica2_ictal_kfold_{SPLIT}_intstride30"
+WANDB_RUN_NAME = f"cnn_channel_transformer_casuistica4_ictal_kfold_{SPLIT}_intstride30"
 
+# 22 canales bipolares seleccionados (Tabla I del paper), en orden canónico
 CANONICAL_22 = [
     "FP1-F7","F7-T7","T7-P7","P7-O1","FP1-F3","F3-C3","C3-P3","P3-O1",
     "FP2-F4","F4-C4","C4-P4","P4-O2","FP2-F8","F8-T8","T8-P8","P8-O2",
@@ -224,8 +272,9 @@ def build_first_index_map(ch_names):
 
 def load_edf_as_X22(edf_path, preload=True):
     """
-    Devuelve X (22, T) float32 normalizado por canal sobre TODA la
-    grabación (per_recording_channel_zscore), idéntico al resto del estudio.
+    Devuelve X (22, T) float32 con z-score por canal sobre TODA la grabación
+    (Sec. V-b, Eq. 2), aplicado antes de trocear en windows. Si falta algún
+    canal canónico se lanza ValueError y el EDF se descarta (Sec. V-a).
     """
     raw = mne.io.read_raw_edf(edf_path, preload=preload, verbose="ERROR")
     mp  = build_first_index_map(raw.ch_names)
@@ -242,7 +291,7 @@ def load_edf_as_X22(edf_path, preload=True):
 
 
 def chunkify(X, sf):
-    """Trocea X (C, T_total) en chunks (N, C, tchunk)."""
+    """Trocea X (C, T_total) en windows de L = CHUNK_SEC s: (n_windows, C, tchunk)."""
     Cc, T  = X.shape
     tchunk = int(round(CHUNK_SEC * sf))
     stride = int(round(STRIDE_SEC * sf))
@@ -257,7 +306,7 @@ def chunkify(X, sf):
 
 
 def infer_tchunk(data_root):
-    """Longitud de chunk en muestras, leyendo el primer EDF disponible."""
+    """Longitud de la window en muestras (L·fs = 512), leyendo el primer EDF disponible."""
     for p in sorted(data_root.iterdir()):
         if p.is_dir() and p.name.startswith("chb"):
             for edf in sorted(p.glob("*.edf")):
@@ -292,7 +341,7 @@ def intervals_overlap(a0, a1, b0, b1):
 
 
 def label_single_chunk(t0, t1, seizure_rows):
-    """Etiqueta de fase de un chunk [t0, t1): ictal / postictal / preictal / interictal."""
+    """Estado de una window [t0, t1) (Sec. III-B): ictal / postictal / preictal / interictal."""
     sph = SPH_MIN*60.0; sop = SOP_MIN*60.0; pos = POSTICTAL_MIN*60.0
     for _, row in seizure_rows.iterrows():
         if intervals_overlap(t0, t1, float(row["start_sec"]), float(row["end_sec"])):
@@ -310,10 +359,11 @@ def label_single_chunk(t0, t1, seizure_rows):
 
 def label_array_for_chunks(n_chunks, seizure_rows):
     """
-    Devuelve (labels_bin, labels_keep), uno por chunk:
+    Devuelve (labels_bin, labels_keep), uno por window:
       labels_bin  : 1 si ictal, 0 en cualquier otro caso.
-      labels_keep : True solo para ictal e interictal (los chunks
-                    válidos para clasificación). preictal/postictal -> False.
+      labels_keep : True solo para ictal e interictal (las windows
+                    válidas como objetivo de clasificación).
+                    preictal/postictal -> False.
     """
     t_start = np.arange(n_chunks, dtype=np.float32) * STRIDE_SEC
     t_end   = t_start + CHUNK_SEC
@@ -326,18 +376,22 @@ def label_array_for_chunks(n_chunks, seizure_rows):
 
 
 # ============================================================
-# DATASET  —  chunks raw sueltos (ictal / interictal)
+# DATASET  —  chunks de N windows (ictal / interictal)
 # ============================================================
 def build_full_pool(all_edfs, seizures_df):
     """
     Construye el POOL COMPLETO de chunks válidos (split por CHUNK).
 
-    Carga TODOS los EDF una sola vez y trocea/ventana con
-    RawWindowDataset(interictal_ratio=None): se conservan todos los chunks
-    ictales (stride 1) y todos los interictales sin solape (stride WINDOW),
-    SIN submuestrear. El mapeo paciente->idx (idx_to_patient) es GLOBAL (todos
-    los pacientes), de modo que los índices de paciente son consistentes en
-    todos los folds. El k-fold reparte luego estos chunks por índices.
+    Carga TODOS los EDF una sola vez, los trocea en windows y los agrupa en
+    chunks con RawWindowDataset(interictal_ratio=None): se conservan todos
+    los chunks ictales (stride 1) y todos los interictales sin solape
+    (stride N = WINDOW), SIN submuestrear. El mapeo paciente->idx
+    (idx_to_patient) es GLOBAL (todos los pacientes), de modo que los
+    índices de paciente son consistentes en todos los folds. El k-fold
+    reparte luego estos chunks por índices.
+    La construcción de los datos no depende del fold (el z-score es por
+    recording), así que construir el pool una sola vez equivale a repetirla
+    en cada fold.
     """
     return RawWindowDataset(all_edfs, seizures_df,
                             interictal_ratio=None, seed=SEED)
@@ -345,16 +399,16 @@ def build_full_pool(all_edfs, seizures_df):
 
 def chunk_kfold_splits(full_ds, n_folds, seed):
     """
-    K-fold por CHUNK (mismo estilo que el antiguo split por paciente, pero la
-    unidad de partición es el CHUNK, no el paciente).
+    K-fold BY CHUNK (Sec. VII-A.a del paper): la unidad de partición es el
+    chunk, no el paciente ni el recording.
 
     Baraja TODOS los chunks válidos del pool con `seed` y los reparte en
     `n_folds` grupos en round-robin (fold[i % n_folds]), SIN tener en cuenta el
     paciente ni el recording de origen. Para cada fold k ese grupo es la
     VALIDACIÓN (~20% de los chunks, 80/20) y el resto es TRAIN. Es el esquema
-    más optimista: chunks ictales casi idénticos (stride 1, comparten 29 de 30
-    ventanas) pueden caer a la vez en train y val -> fuga temporal en la clase
-    positiva (cota superior optimista de rendimiento).
+    más optimista: chunks ictales casi idénticos (stride 1, comparten 29 de sus
+    30 windows) pueden caer a la vez en train y val -> fuga temporal en la
+    clase positiva (cota superior optimista de rendimiento).
 
     Yields, por cada fold:
         (fold_idx, train_idx, val_idx)
@@ -389,31 +443,33 @@ def chunk_kfold_splits(full_ds, n_folds, seed):
 
 class RawWindowDataset(Dataset):
     """
-    Construye secuencias de WINDOW chunks consecutivos.
+    Construye los CHUNKS del paper: secuencias de N = WINDOW windows
+    consecutivas de un mismo recording.
 
-    Cada sample: (X_seq, label, patient_idx)
-      X_seq       : (WINDOW, C, T)  los WINDOW chunks con sus canales intactos
-                                    La CNN los procesa canal por canal en el forward
-      label       : etiqueta del ÚLTIMO chunk de la ventana
+    Cada sample (= un chunk): (X_seq, label, patient_idx)
+      X_seq       : (WINDOW, C, T)  las N windows del chunk con sus canales intactos
+                                    La CNN procesa cada canal y el Transformer
+                                    mezcla los 22 descriptores en el forward
+      label       : etiqueta de la ÚLTIMA window del chunk
                     0 interictal / 1 ictal
-      patient_idx : índice entero del paciente al que pertenece la ventana
+      patient_idx : índice entero del paciente al que pertenece el chunk
                     (se mapea con self.idx_to_patient). Permite calcular
                     métricas por paciente en validación.
 
-    La ventana se desliza con DOS strides distintos según la clase del
-    último chunk de la ventana (que es el que determina su etiqueta):
-      - ventanas ICTALES: stride STRIDE_WIN (=1), muestreo denso.
-      - ventanas INTERICTALES: stride STRIDE_WIN_INTERICTAL (=WINDOW=30),
-        de forma que las ventanas interictales NO se solapan.
-    Una secuencia se incluye solo si el último chunk es ictal o interictal
-    (no preictal/postictal). Los chunks anteriores de la ventana pueden ser de
+    El chunk se desliza con DOS strides distintos según la clase de su
+    última window (que es la que determina su etiqueta):
+      - chunks ICTALES: stride STRIDE_WIN (=1), muestreo denso.
+      - chunks INTERICTALES: stride STRIDE_WIN_INTERICTAL (=N=30),
+        de forma que los chunks interictales NO se solapan.
+    Un chunk se incluye solo si su última window es ictal o interictal
+    (no preictal/postictal). Las 29 windows anteriores pueden ser de
     cualquier fase — son el contexto temporal de la LSTM.
 
     Submuestreo: si interictal_ratio no es None, se conservan todos los
-    samples ictales y se submuestrean los interictales al ratio dado
-    (se usa en TRAIN con SEED para balancear 1:1). Si interictal_ratio es
-    None NO se submuestrea nada: se conserva todo el interictal (uso en
-    VALIDACIÓN, para no balancear y obtener métricas fiables).
+    chunks ictales y se submuestrean los interictales al ratio dado
+    (TRAIN, con SEED, para balancear 1:1). Si interictal_ratio es None NO se
+    submuestrea nada: se conserva todo el interictal (validación sin
+    rebalancear, o el pool completo en by chunk / by recording).
     """
     def __init__(self, edf_files, seizures_df, interictal_ratio=None, seed=123):
         # cada elemento es (seq, patient_name) para arrastrar el paciente
@@ -423,7 +479,7 @@ class RawWindowDataset(Dataset):
         for edf in edf_files:
             try:
                 X, sf  = load_edf_as_X22(edf, preload=PRELOAD_EDF)
-                chunks = chunkify(X, sf)                   # (N, C, T)
+                chunks = chunkify(X, sf)                   # (N, C, T), N = nº de windows
                 N, Cc, T = chunks.shape
                 if N < WINDOW:
                     continue
@@ -435,28 +491,29 @@ class RawWindowDataset(Dataset):
                 ].copy()
                 labels_bin, labels_keep = label_array_for_chunks(N, rows)
 
-                # Deslizar la ventana — guardamos (C, T) por chunk, sin aplanar.
-                # La etiqueta de cada ventana es la de su ÚLTIMO chunk.
-                # Se usan DOS strides distintos según la clase del último chunk:
+                # Construir los chunks: N windows consecutivas, guardando
+                # (C, T) por window, sin aplanar. La etiqueta de cada chunk es
+                # la de su ÚLTIMA window. Se usan DOS strides distintos según
+                # la clase de esa última window:
                 #
                 #   ICTAL      -> stride STRIDE_WIN (=1): muestreo denso, se
-                #                 capturan todas las ventanas cuyo último chunk
+                #                 capturan todos los chunks cuya última window
                 #                 es ictal (clase positiva, escasa).
-                #   INTERICTAL -> stride STRIDE_WIN_INTERICTAL (=WINDOW=30):
-                #                 ventanas interictales SIN solape (cada una
-                #                 60 s después de la anterior). Reduce ~30x el
-                #                 nº de ventanas interictales.
+                #   INTERICTAL -> stride STRIDE_WIN_INTERICTAL (=N=30):
+                #                 chunks interictales SIN solape (cada uno
+                #                 60 s después del anterior). Reduce ~30x el
+                #                 nº de chunks interictales.
                 #
                 # Son dos pasadas independientes: la pasada ictal solo añade
-                # ventanas ictales y la interictal solo añade interictales, así
-                # que ninguna ventana se cuenta dos veces.
+                # chunks ictales y la interictal solo añade interictales, así
+                # que ningún chunk se cuenta dos veces.
 
                 # --- pasada ICTAL (stride 1) ---
                 for end in range(WINDOW, N + 1, STRIDE_WIN):
-                    last = end - 1            # índice del último chunk
+                    last = end - 1            # índice de la última window del chunk
                     # labels_bin[last]==1 implica ictal (que siempre es 'keep')
                     if labels_bin[last] == 1:
-                        seq = chunks[end - WINDOW:end]   # (WINDOW, C, T)
+                        seq = chunks[end - WINDOW:end]   # (WINDOW, C, T) = un chunk
                         ict_samples.append((seq, patient))
 
                 # --- pasada INTERICTAL (stride 30, sin solape) ---
@@ -465,7 +522,7 @@ class RawWindowDataset(Dataset):
                     # interictal = keep (ictal/interictal) y NO ictal.
                     # El check de keep excluye preictal/postictal.
                     if labels_keep[last] and labels_bin[last] == 0:
-                        seq = chunks[end - WINDOW:end]   # (WINDOW, C, T)
+                        seq = chunks[end - WINDOW:end]   # (WINDOW, C, T) = un chunk
                         int_samples.append((seq, patient))
 
             except Exception as e:
@@ -477,7 +534,7 @@ class RawWindowDataset(Dataset):
               f"ratio_natural={n_int_total / max(1, n_ict_total):.1f}x")
 
         # submuestreo del interictal (solo si interictal_ratio no es None;
-        # en validación se pasa None -> NO se submuestrea, val sin balancear)
+        # con None -> NO se submuestrea: validación y pool completo)
         if interictal_ratio is not None and n_ict_total > 0:
             n_int_keep = min(n_int_total, n_ict_total * int(interictal_ratio))
             if n_int_keep < n_int_total:
@@ -515,7 +572,8 @@ class RawWindowDataset(Dataset):
 
     def __getitem__(self, idx):
         seq, label, pidx = self.samples[idx]
-        # seq: (WINDOW, C, T) — la CNN necesita los canales separados
+        # seq: (WINDOW, C, T) = un chunk de N windows; la CNN ve cada canal y
+        # el Transformer los mezcla
         X = torch.from_numpy(np.ascontiguousarray(seq)).float()
         y = torch.tensor(label, dtype=torch.float32)
         p = torch.tensor(pidx, dtype=torch.long)
@@ -567,7 +625,7 @@ def make_train_val_datasets(full_ds, train_idx, val_idx,
     partir de los índices del pool.
 
     - VAL: todos los chunks de `val_idx` (sin rebalancear) -> se conserva todo
-      el interictal (métricas fiables con desbalance real). val_interictal_ratio
+      el interictal (el interictal sigue siendo mayoría). val_interictal_ratio
       se mantiene por simetría con la API anterior; con None (por defecto) el
       val no se submuestrea.
     - TRAIN: si train_interictal_ratio no es None, se submuestrea el interictal
@@ -615,13 +673,15 @@ def make_train_val_datasets(full_ds, train_idx, val_idx,
 
 
 # ============================================================
-# MODELO  —  CNN por canal + flatten + LSTM sobre ventana temporal
+# MODELO  —  S4 (CNN + Transformer): CNN por canal + Transformer inter-canal
+#             + LSTM compartida
 # ============================================================
 class ChannelCNN(nn.Module):
     """
     CNN 1D pequeña aplicada POR CANAL (pesos compartidos entre canales).
+    Idéntica a la de S2 (Tabla IV del paper).
 
-    Entrada: (B*, 1, T)   un canal de un chunk
+    Entrada: (B*, 1, T)   un canal de una window
     Salida:  (B*, CNN_OUT) vector representativo del canal
 
     Aprende patrones temporales locales dentro de cada canal
@@ -663,32 +723,110 @@ class ChannelCNN(nn.Module):
         return self.proj(x)     # (B*, CNN_OUT)
 
 
-class RawCNNWindowLSTM(nn.Module):
+class ChannelTransformer(nn.Module):
+    """
+    Transformer encoder que mezcla los C tokens (descriptores por canal)
+    vía self-attention. La diferencia con S3 es que los tokens vienen
+    de la CNN (CNN_OUT dims, típicamente 64) en vez del raw (T dims, 512).
+
+    Entrada: (B*, C, CNN_OUT)  los 22 descriptores F_i de la window
+    Salida:  (B*, D_MODEL)     representación de la window v_i (token CLS)
+
+    Pipeline:
+      (B*, C, CNN_OUT)
+        ↓  prepend CLS (aprendible, dim CNN_OUT)  -> (B*, C+1, CNN_OUT)
+        ↓  Linear(CNN_OUT -> D_MODEL) por token   -> (B*, C+1, D_MODEL)
+        ↓  Transformer encoder pre-norm           -> (B*, C+1, D_MODEL)
+        ↓  tomar token CLS (posición 0)           -> (B*, D_MODEL)
+        ↓  LayerNorm final (norm_out)             -> (B*, D_MODEL)
+
+    Sin channel embedding (igual que en S3, y que S6 en el paper): los
+    canales se tratan como conjunto sin orden. El orden canónico de la
+    lista no codifica topología real del montaje bipolar.
+
+    Nota: el paper (Sec. VI-G) define v_i = h_CLS; el código aplica además
+    una LayerNorm final (norm_out) sobre la salida del CLS.
+    """
+    def __init__(self, token_dim=CNN_OUT, d_model=D_MODEL, n_heads=N_HEADS,
+                 n_layers=N_TF_LAYERS, dim_ffn=DIM_FFN,
+                 dropout=TF_DROPOUT, activation=TF_ACTIVATION):
+        super().__init__()
+        self.token_dim = int(token_dim)
+        self.d_model   = d_model
+
+        # CLS token aprendible con la dim de los descriptores de la CNN
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.token_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        # Proyección lineal CNN_OUT -> D_MODEL, compartida por todos los tokens
+        self.token_proj = nn.Linear(self.token_dim, d_model)
+
+        # Transformer encoder pre-norm
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model         = d_model,
+            nhead           = n_heads,
+            dim_feedforward = dim_ffn,
+            dropout         = dropout,
+            activation      = activation,
+            batch_first     = True,
+            norm_first      = True,   # pre-norm
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # LayerNorm final aplicado al token CLS
+        self.norm_out = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        """
+        x: (B*, C, CNN_OUT)  -> descriptores por canal, canales como tokens
+        return: (B*, D_MODEL)  representación de la window vía CLS
+        """
+        Bx = x.shape[0]
+        cls = self.cls_token.expand(Bx, -1, -1)        # (B*, 1, CNN_OUT)
+        tokens = torch.cat([cls, x], dim=1)             # (B*, C+1, CNN_OUT)
+        tokens = self.token_proj(tokens)                # (B*, C+1, D_MODEL)
+        tokens = self.encoder(tokens)                   # (B*, C+1, D_MODEL)
+        cls_out = tokens[:, 0]                          # (B*, D_MODEL)
+        return self.norm_out(cls_out)
+
+
+class CNNChannelTransformerWindowLSTM(nn.Module):
     """
     Pipeline completo:
 
       X_seq (B, WINDOW, C, T)
-        ↓  para cada chunk de la secuencia:
+        ↓  para cada window del chunk  (g(·)):
            reshape -> (B*WINDOW*C, 1, T)
            CNN por canal (pesos compartidos) -> (B*WINDOW*C, CNN_OUT)
-           reshape -> (B*WINDOW, C, CNN_OUT)
-           flatten canales -> (B*WINDOW, C*CNN_OUT)   <- representación del chunk
+           reshape -> (B*WINDOW, C, CNN_OUT)            <- F_i por window
+           ChannelTransformer (CLS + proj + encoder) -> (B*WINDOW, D_MODEL)  <- v_i
         ↓
-        reshape -> (B, WINDOW, C*CNN_OUT)             <- secuencia para la LSTM
-        LSTM(input=C*CNN_OUT, hidden=HIDDEN)
+        reshape -> (B, WINDOW, D_MODEL)                 <- secuencia para la LSTM
+        LSTM(input=D_MODEL, hidden=HIDDEN)
         ↓
         último hidden state (B, HIDDEN)
         head(LayerNorm + Dropout + Linear)
         ↓
-        logit (B,)   del ÚLTIMO chunk de la ventana
+        logit (B,)   de la ÚLTIMA window del chunk
     """
-    def __init__(self, cnn_out=CNN_OUT, hidden_size=HIDDEN,
-                 num_layers=N_LAYERS, dropout=DROPOUT):
+    def __init__(self, cnn_out=CNN_OUT, d_model=D_MODEL, n_heads=N_HEADS,
+                 n_tf_layers=N_TF_LAYERS, dim_ffn=DIM_FFN,
+                 tf_dropout=TF_DROPOUT,
+                 hidden_size=HIDDEN, num_layers=N_LAYERS,
+                 dropout=DROPOUT):
         super().__init__()
-        self.cnn  = ChannelCNN(out_dim=cnn_out)
-        lstm_input = C * cnn_out           # 22 * 64 = 1408
+        self.cnn = ChannelCNN(out_dim=cnn_out)
+        self.channel_tf = ChannelTransformer(
+            token_dim  = cnn_out,
+            d_model    = d_model,
+            n_heads    = n_heads,
+            n_layers   = n_tf_layers,
+            dim_ffn    = dim_ffn,
+            dropout    = tf_dropout,
+            activation = TF_ACTIVATION,
+        )
         self.lstm = nn.LSTM(
-            input_size  = lstm_input,
+            input_size  = d_model,
             hidden_size = hidden_size,
             num_layers  = num_layers,
             batch_first = True,
@@ -707,20 +845,23 @@ class RawCNNWindowLSTM(nn.Module):
         """
         B, W, Cc, T = X_seq.shape
 
-        # aplicar CNN a todos los canales de todos los chunks a la vez
+        # g(·), paso 1) CNN por canal -> 22 descriptores F_i por window
         x = X_seq.reshape(B * W * Cc, 1, T)       # (B*WINDOW*C, 1, T)
         f = self.cnn(x)                            # (B*WINDOW*C, CNN_OUT)
-        f = f.reshape(B * W, Cc, -1)               # (B*WINDOW, C, CNN_OUT)
-        f = f.reshape(B * W, Cc * f.shape[-1])     # (B*WINDOW, C*CNN_OUT)
-        f = f.reshape(B, W, -1)                    # (B, WINDOW, C*CNN_OUT)
+        f = f.reshape(B * W, Cc, -1)               # (B*WINDOW, C, CNN_OUT) = F_i
 
-        _, (hn, _) = self.lstm(f)                  # hn: (layers, B, HIDDEN)
+        # g(·), paso 2) Transformer inter-canal -> v_i (resumen de la window vía CLS)
+        g = self.channel_tf(f)                     # (B*WINDOW, D_MODEL)
+        g = g.reshape(B, W, -1)                    # (B, WINDOW, D_MODEL)
+
+        # 3) LSTM compartida sobre las N windows del chunk
+        _, (hn, _) = self.lstm(g)                  # hn: (layers, B, HIDDEN)
         h = hn[-1]                                 # (B, HIDDEN)
         return self.head(h).squeeze(-1)            # (B,)
 
 
 # ============================================================
-# MÉTRICAS  —  idénticas a lstm_baseline.py
+# MÉTRICAS  (Eq. 8 del paper)  —  idénticas en S1–S4
 # ============================================================
 def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict:
     """logits: (B,) sin sigmoid;  labels: (B,) 0/1 float."""
@@ -750,7 +891,12 @@ def metrics_from_counts(tp, tn, fp, fn) -> dict:
     """
     Métricas a partir de conteos de confusión (enteros). Devuelve NaN cuando
     el denominador es 0 (p.ej. precision si el modelo no predice positivos
-    para ese paciente, o recall si el paciente no tiene ventanas ictales).
+    para ese paciente, o recall si el paciente no tiene chunks ictales).
+
+    Nota para reproducir las tablas por paciente del paper (IX–XI): aquí F1
+    sale NaN siempre que TP = 0, y _nan_mean_std lo excluye de la media. En
+    las tablas del paper, los pacientes con P = R = 0 aparecen con F1 = 0 y
+    cuentan en la media ± std entre pacientes.
     """
     tp, tn, fp, fn = int(tp), int(tn), int(fp), int(fn)
     tot = tp + tn + fp + fn
@@ -996,7 +1142,7 @@ def run_one_fold(fold_idx, n_folds, train_ds, val_ds, tchunk, sf0, device):
         num_workers=0, pin_memory=(device == "cuda"),
     )
 
-    # --- pos_weight = n_interictal / n_ictal ---
+    # --- pos_weight = n_interictal / n_ictal (≈ 1: el train ya está balanceado 1:1) ---
     n0, n1 = train_ds.n_int, train_ds.n_ict
     print(f"[{tag}] Train sequences  ->  interictal: {n0}  ictal: {n1}  "
           f"ratio: {n0/max(1,n1):.1f}x")
@@ -1005,23 +1151,31 @@ def run_one_fold(fold_idx, n_folds, train_ds, val_ds, tchunk, sf0, device):
     criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     # --- Modelo (init idéntico en todos los folds por seed_everything(SEED)) ---
-    model = RawCNNWindowLSTM(
-        cnn_out     = CNN_OUT,
-        hidden_size = HIDDEN,
-        num_layers  = N_LAYERS,
-        dropout     = DROPOUT,
+    model = CNNChannelTransformerWindowLSTM(
+        cnn_out      = CNN_OUT,
+        d_model      = D_MODEL,
+        n_heads      = N_HEADS,
+        n_tf_layers  = N_TF_LAYERS,
+        dim_ffn      = DIM_FFN,
+        tf_dropout   = TF_DROPOUT,
+        hidden_size  = HIDDEN,
+        num_layers   = N_LAYERS,
+        dropout      = DROPOUT,
     ).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_cnn   = sum(p.numel() for p in model.cnn.parameters()  if p.requires_grad)
-    n_lstm  = sum(p.numel() for p in model.lstm.parameters() if p.requires_grad)
-    n_head  = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
-    lstm_input = C * CNN_OUT
-    print(f"\n[{tag}] Modelo RawCNNWindowLSTM")
-    print(f"  CNN por canal   : {CNN_CHANNELS} filtros, kernels {CNN_KERNELS} -> {CNN_OUT} dims/canal")
-    print(f"  repr. por chunk : {C} canales × {CNN_OUT} dims = {lstm_input} dims (flatten)")
-    print(f"  secuencia LSTM  : {WINDOW} pasos (un chunk por paso)")
-    print(f"  parámetros      : {n_train:,}  "
-          f"(CNN={n_cnn:,}  LSTM={n_lstm:,}  head={n_head:,})")
+    n_cnn   = sum(p.numel() for p in model.cnn.parameters()         if p.requires_grad)
+    n_tf    = sum(p.numel() for p in model.channel_tf.parameters()  if p.requires_grad)
+    n_lstm  = sum(p.numel() for p in model.lstm.parameters()        if p.requires_grad)
+    n_head  = sum(p.numel() for p in model.head.parameters()        if p.requires_grad)
+    print(f"\n[{tag}] Modelo CNNChannelTransformerWindowLSTM")
+    print(f"  CNN por canal           : {CNN_CHANNELS} filtros, kernels {CNN_KERNELS} -> {CNN_OUT} dims/canal")
+    print(f"  Transformer inter-canal : tokens={C} descriptores+CLS ({C+1} tokens)")
+    print(f"                            d_model={D_MODEL}  heads={N_HEADS}  "
+          f"layers={N_TF_LAYERS}  ffn={DIM_FFN}  dropout={TF_DROPOUT}")
+    print(f"  repr. por chunk         : token CLS -> {D_MODEL} dims")
+    print(f"  secuencia LSTM          : {WINDOW} pasos (un chunk por paso)")
+    print(f"  parámetros              : {n_train:,}  "
+          f"(CNN={n_cnn:,}  TF={n_tf:,}  LSTM={n_lstm:,}  head={n_head:,})")
 
     optimizer = optim.Adam(model.parameters(), lr=LR,
                            weight_decay=WEIGHT_DECAY)
@@ -1035,7 +1189,7 @@ def run_one_fold(fold_idx, n_folds, train_ds, val_ds, tchunk, sf0, device):
         job_type="fold",
         reinit=True,
         config={
-            "casuistica":    "raw_cnn_lstm_window",
+            "casuistica":    "cnn_channel_transformer_lstm_window",
             "task":          "ictal_vs_interictal",
             "sequence":      "window_chunks",
             "cv":            "chunk_kfold",
@@ -1053,7 +1207,16 @@ def run_one_fold(fold_idx, n_folds, train_ds, val_ds, tchunk, sf0, device):
             "cnn_pools":     list(CNN_POOLS),
             "cnn_out":       CNN_OUT,
             "cnn_dropout":   CNN_DROPOUT,
-            "lstm_input":    C * CNN_OUT,
+            "d_model":       D_MODEL,
+            "n_heads":       N_HEADS,
+            "n_tf_layers":   N_TF_LAYERS,
+            "dim_ffn":       DIM_FFN,
+            "tf_dropout":    TF_DROPOUT,
+            "tf_activation": TF_ACTIVATION,
+            "tf_norm_first": True,
+            "channel_embedding": "none",
+            "n_tokens":      C + 1,
+            "lstm_input":    D_MODEL,
             "HIDDEN": HIDDEN, "N_LAYERS": N_LAYERS, "DROPOUT": DROPOUT,
             "BATCH_SIZE": BATCH_SIZE, "EPOCHS": EPOCHS,
             "LR": LR, "WEIGHT_DECAY": WEIGHT_DECAY,
@@ -1065,6 +1228,7 @@ def run_one_fold(fold_idx, n_folds, train_ds, val_ds, tchunk, sf0, device):
             "val_seed": VAL_SEED,
             "n_params_trainable": n_train,
             "n_params_cnn":  n_cnn,
+            "n_params_tf":   n_tf,
             "n_params_lstm": n_lstm,
             "n_params_head": n_head,
             "pos_weight": float(pos_weight.item()),
@@ -1154,10 +1318,13 @@ def run_one_fold(fold_idx, n_folds, train_ds, val_ds, tchunk, sf0, device):
             "CNN_KERNELS":  list(CNN_KERNELS),
             "CNN_POOLS":    list(CNN_POOLS),
             "CNN_OUT":      CNN_OUT,
+            "D_MODEL": D_MODEL, "N_HEADS": N_HEADS,
+            "N_TF_LAYERS": N_TF_LAYERS, "DIM_FFN": DIM_FFN,
+            "TF_DROPOUT": TF_DROPOUT,
             "HIDDEN": HIDDEN,
             "N_LAYERS": N_LAYERS, "DROPOUT": DROPOUT,
             "task": "ictal_vs_interictal",
-            "casuistica": "raw_cnn_lstm_window",
+            "casuistica": "cnn_channel_transformer_lstm_window",
             "cv": "chunk_kfold",
             "n_folds": n_folds,
             "checkpoint": "last_epoch",
@@ -1165,7 +1332,7 @@ def run_one_fold(fold_idx, n_folds, train_ds, val_ds, tchunk, sf0, device):
     }, last_path)
     try:
         artifact = wandb.Artifact(
-            name=f"raw-cnn-lstm-casuistica2-ictal-{SPLIT}-fold{fold_idx}-last",
+            name=f"cnn-channel-transformer-casuistica4-ictal-{SPLIT}-fold{fold_idx}-last",
             type="model",
             metadata={"val_f1": float(last_val_m["f1"]),
                       "epoch": int(EPOCHS), "fold": int(fold_idx)},
@@ -1240,11 +1407,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
     print("=" * 60)
-    print("CASUÍSTICA 2a:  raw -> CNN por canal -> LSTM (ventana)")
+    print("CASUÍSTICA 4:  CNN por canal -> Transformer inter-canal -> LSTM")
     print(f"            K-FOLD por CHUNK | {N_FOLDS} folds | ictal vs interictal")
     print("=" * 60)
 
-    # --- tchunk (= longitud de chunk en muestras) ---
+    # --- tchunk: muestras por window (L·fs = 512) ---
     tchunk, sf0 = infer_tchunk(DATA_ROOT)
     print(f"sfreq={sf0} Hz  ->  tchunk={tchunk} samples ({CHUNK_SEC}s)")
 
@@ -1466,7 +1633,7 @@ def main():
             job_type="summary",
             reinit=True,
             config={
-                "casuistica": "raw_cnn_lstm_window",
+                "casuistica": "cnn_channel_transformer_lstm_window",
                 "task": "ictal_vs_interictal",
                 "cv": "chunk_kfold",
                 "split": SPLIT,

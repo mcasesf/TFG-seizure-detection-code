@@ -1,0 +1,20 @@
+# Outputs of the experiment scripts (written to the working directory)
+checkpoints_*/
+eval_*.csv
+wandb/
+
+# Data (CHB-MIT and the seizure manifest are obtained separately, see data/README.md)
+*.edf
+chb-mit-scalp-eeg-database-*/
+physionet.org/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
